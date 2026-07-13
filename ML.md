@@ -2,10 +2,13 @@
 
 Production image-classification system that identifies crop diseases from farmer-captured smartphone photos across 7 crops and 30 classes. Two deployment targets from one training pipeline: a **web app** (server-side inference, full-accuracy model) and a **mobile app** (on-device inference, works fully offline, syncs when online).
 
+> **v1.1 update:** This revision adds a data-driven gate for whether the dual-model (teacher/student) architecture is actually justified, a hard field-data readiness check, an architecture-benchmarking step before committing to a backbone, remote model loading for mobile (instead of APK-bundling), and explicit privacy/consent and multi-lesion scoping notes. See Section 0 and the callouts marked **[FIX]** throughout.
+
 ---
 
 ## Table of Contents
 
+0. [Before You Build: Decision Gates](#0-before-you-build-decision-gates)
 1. [Class Taxonomy](#1-class-taxonomy)
 2. [Dual-Model Strategy: Teacher (Web) + Student (Mobile)](#2-dual-model-strategy-teacher-web--student-mobile)
 3. [Project Structure](#3-project-structure)
@@ -30,7 +33,67 @@ Production image-classification system that identifies crop diseases from farmer
 22. [Offline Sync Architecture](#22-offline-sync-architecture)
 23. [Monitoring](#23-monitoring)
 24. [Verifying Generalization to Farmer-Captured Images](#24-verifying-generalization-to-farmer-captured-images)
-25. [Troubleshooting](#25-troubleshooting)
+25. [Privacy, Consent & Data Governance](#25-privacy-consent--data-governance)
+26. [Mobile Model Versioning & Rollback](#26-mobile-model-versioning--rollback)
+27. [Scope Limitations: Multi-Lesion & Co-Infection](#27-scope-limitations-multi-lesion--co-infection)
+28. [Troubleshooting](#28-troubleshooting)
+
+---
+
+## 0. Before You Build: Decision Gates
+
+**[FIX]** Don't start full-scale training until these two questions are answered with real data. Skipping this step is the single biggest source of wasted engineering effort in a project like this.
+
+### 0.1 Is the dual-model (teacher + student) architecture actually justified?
+
+Instrument the *current* app (or run a short survey via extension workers/NGOs) to measure: **what fraction of prediction sessions happen with no connectivity at capture time?**
+
+```python
+# scripts/architecture_benchmark.py
+"""
+Run this decision BEFORE committing to the full distillation pipeline in Section 15.
+"""
+OFFLINE_SESSION_RATE = 0.18  # <- replace with your measured value
+
+if OFFLINE_SESSION_RATE < 0.15:
+    print("Offline usage is low. Consider the SIMPLER path:")
+    print(" -> One architecture, INT8-quantized identically for web and mobile.")
+    print(" -> Skip distillation, skip separate student calibration/OOD thresholds.")
+    print(" -> Re-evaluate this gate quarterly as adoption grows in low-connectivity regions.")
+else:
+    print("Offline usage is substantial. Dual-model (teacher/student) is justified.")
+    print(" -> Proceed with the full pipeline in Section 2 and Section 15.")
+```
+
+This is a go/no-go gate, not a suggestion — put it in your project plan as a literal checkpoint before Section 15 work begins.
+
+### 0.2 Which backbone actually earns its parameter count?
+
+Don't default to the largest plausible model. Benchmark 2-3 candidates for a few epochs before committing to a full training run:
+
+```python
+# scripts/architecture_benchmark.py (continued)
+CANDIDATES = [
+    "tf_efficientnetv2_s.in21k_ft_in1k",   # ~21M params — baseline assumption
+    "tf_efficientnetv2_b0.in1k",            # ~7M params — cheaper server compute
+    "convnext_tiny.in12k_ft_in1k",          # comparable accuracy class, different inductive bias
+]
+
+# For each candidate:
+#   - Train phase 1 + phase 2 only (~13 epochs, see Section 9)
+#   - Compare: val_macro_f1, param count, p95 latency on YOUR actual GPU
+#   - Pick the smallest model that clears your accuracy bar, not the biggest available
+```
+
+This costs about a day of compute and can save years of unnecessarily expensive server inference.
+
+### 0.3 Hard field-data readiness gate
+
+**[FIX]** This turns the "collect field data" recommendation from a wishlist item into a blocking CI check (full implementation in Section 4.4).
+
+```
+Release is BLOCKED if any trained class has fewer than 200 field-sourced images.
+```
 
 ---
 
@@ -68,9 +131,13 @@ CLASS_TO_IDX = {c: i for i, c in enumerate(CLASSES)}
 
 A 31st implicit label, `Unknown`, is handled at inference time via OOD detection (Section 14), not trained as a normal class. Both teacher and student models share this exact taxonomy so predictions are consistent across web and mobile.
 
+**[FIX — see Section 27]** This taxonomy assumes single-label classification (one disease per image). If field data shows meaningful rates of co-infection or multiple simultaneous stresses on one leaf, revisit this before scaling data collection — it changes the labeling protocol, not just the model.
+
 ---
 
 # 2. Dual-Model Strategy: Teacher (Cloud) + Student (Mobile) Hybrid Intelligence
+
+> **[FIX]** Only build this if Section 0.1's gate says dual-model is justified. If offline usage is low, replace this entire section with a single quantized model shared by both deployment targets — same taxonomy, same preprocessing, same calibration, one export path instead of two.
 
 One training pipeline produces **two exported AI artifacts** that share the same:
 
@@ -94,7 +161,7 @@ This provides the highest possible accuracy while maintaining accessibility in r
 
 | | Teacher Model (Cloud AI Engine) | Student Model (Mobile AI Engine) |
 |---|---|---|
-| Architecture | EfficientNetV2-S (~21M parameters) | MobileNetV3-Large / EfficientNet-Lite0 (~4-5M parameters) |
+| Architecture | EfficientNetV2-S (~21M parameters) — *validate against Section 0.2 benchmark before finalizing* | MobileNetV3-Large / EfficientNet-Lite0 (~4-5M parameters) |
 | Execution Environment | Cloud Server (FastAPI + GPU) | User Device (CPU/NPU) |
 | Connectivity | Requires internet | Works fully offline |
 | Primary Role | Main prediction engine | Offline fallback engine |
@@ -107,7 +174,7 @@ This provides the highest possible accuracy while maintaining accessibility in r
 
 ## Why Two Models?
 
-A single model cannot efficiently satisfy both cloud accuracy requirements and mobile limitations.
+A single model cannot efficiently satisfy both cloud accuracy requirements and mobile limitations — **assuming Section 0.1's gate confirmed this trade-off is worth the added complexity.**
 
 ### Using EfficientNetV2-S Everywhere
 
@@ -383,7 +450,7 @@ This allows the lightweight mobile model to recover most of the accuracy lost du
 
 ## Shared Calibration and OOD Detection
 
-Both models use the same methodology:
+Both models use the same methodology (fitted with separate parameters — see Section 13-14):
 
 ### Temperature Scaling
 
@@ -489,11 +556,13 @@ TFLite Conversion
 INT8 Quantization
         |
         ↓
-Mobile Application Bundle
+Mobile Application Bundle (or remote download — see Section 26)
         |
         ↓
 Offline AI Prediction
 ```
+
+---
 
 ## 3. Project Structure
 
@@ -525,6 +594,8 @@ crop-disease-classifier/
 │   ├── ood_detector.py
 │   └── export.py
 ├── scripts/
+│   ├── architecture_benchmark.py  # [FIX] Section 0 decision gates
+│   ├── check_release_readiness.py # [FIX] Section 4.4 field-data gate
 │   ├── prepare_dataset.py
 │   ├── build_splits.py
 │   ├── benchmark_latency.py
@@ -544,13 +615,15 @@ crop-disease-classifier/
 ├── mobile/                        # MOBILE APP (offline-first)
 │   ├── assets/
 │   │   └── models/
-│   │       ├── model_int8.tflite       # or .onnx for ONNX Runtime Mobile
-│   │       └── model_metadata.json     # classes, temperature, thresholds
+│   │       ├── model_int8.tflite       # fallback bundled version — see Section 26
+│   │       └── model_metadata.json     # classes, temperature, thresholds, version
 │   ├── src/
 │   │   ├── inference/
 │   │   │   ├── onDeviceModel.ts        # loads + runs TFLite/ONNX Mobile
 │   │   │   ├── preprocess.ts           # matches src/datasets.py exactly
 │   │   │   └── oodGuard.ts             # on-device energy/confidence check
+│   │   ├── modelManager/
+│   │   │   └── remoteModelLoader.ts    # [FIX] Section 26 — download/verify/rollback
 │   │   ├── storage/
 │   │   │   ├── localDb.ts              # SQLite/WatermelonDB - predictions, images
 │   │   │   └── syncQueue.ts            # queues unsynced records
@@ -606,7 +679,7 @@ Public datasets are overwhelmingly **lab-condition images** (plain backgrounds, 
    - Multiple phone models (budget Android to iPhone) — **this matters even more for the mobile student**, since low-end phone cameras/CPUs are the exact target hardware
 2. Target minimum **200–500 field images per class** before first production release; more for high-priority/high-confusion classes (Early vs. Late Blight, Stripe vs. Leaf Rust).
 3. Use a lightweight internal labeling tool (e.g., Label Studio) with **2 independent annotators + adjudication** for disputed labels; track inter-annotator agreement (Cohen's kappa, target > 0.75).
-4. Tag every image with metadata: `source` (public/field), `device`, `location`, `capture_date`, `annotator_id` — required later for leakage-safe splitting and generalization testing.
+4. Tag every image with metadata: `source` (public/field), `device`, `location`, `capture_date`, `annotator_id` — required later for leakage-safe splitting and generalization testing. **Get and record farmer consent at collection time — see Section 25.**
 
 ### 4.3 Curation pipeline
 
@@ -618,7 +691,7 @@ Public datasets are overwhelmingly **lab-condition images** (plain backgrounds, 
 3. Reject images below minimum resolution (e.g., <224px shorter side).
 4. Normalize EXIF orientation.
 5. Remap source-dataset class names -> unified taxonomy; drop or bucket unmapped classes.
-6. Write manifest CSV: filepath, class, source, device, location, split_group.
+6. Write manifest CSV: filepath, class, source, device, location, split_group, consent_status.
 """
 import hashlib
 from PIL import Image, ImageOps
@@ -643,6 +716,41 @@ def normalize_orientation(path, out_path):
     img = ImageOps.exif_transpose(img).convert("RGB")
     img.save(out_path, quality=95)
 ```
+
+### 4.4 [FIX] Hard field-data release gate
+
+Turn the recommendation above into a blocking check, run in CI before any production export:
+
+```python
+# scripts/check_release_readiness.py
+import pandas as pd
+
+MIN_FIELD_IMAGES_PER_CLASS = 200
+
+class ReleaseBlockedError(Exception):
+    pass
+
+def check_field_data_sufficiency(manifest_path="data/splits.json"):
+    df = pd.read_json(manifest_path)
+    field_only = df[df["source"] == "field"]
+    counts = field_only["class"].value_counts()
+    all_classes = df["class"].unique()
+    insufficient = {
+        c: int(counts.get(c, 0))
+        for c in all_classes
+        if counts.get(c, 0) < MIN_FIELD_IMAGES_PER_CLASS
+    }
+    if insufficient:
+        raise ReleaseBlockedError(
+            f"Release blocked. Classes below {MIN_FIELD_IMAGES_PER_CLASS} field images: {insufficient}"
+        )
+    print("Field-data sufficiency check passed.")
+
+if __name__ == "__main__":
+    check_field_data_sufficiency()
+```
+
+Wire this into your CI/CD pipeline as a required step before `src/export.py` runs for a production build.
 
 ---
 
@@ -825,9 +933,11 @@ class ClassBalancedFocalLoss(nn.Module):
 import timm
 import torch.nn as nn
 
-def build_model(num_classes=30, pretrained=True):
+def build_model(num_classes=30, pretrained=True, backbone="tf_efficientnetv2_s.in21k_ft_in1k"):
+    # backbone should be selected using scripts/architecture_benchmark.py (Section 0.2),
+    # not assumed by default.
     model = timm.create_model(
-        "tf_efficientnetv2_s.in21k_ft_in1k",
+        backbone,
         pretrained=pretrained,
         num_classes=num_classes,
         drop_rate=0.3,
@@ -890,7 +1000,7 @@ label_smoothing: 0.1
 ema_decay: 0.9998        # exponential moving average of weights — improves eval stability
 ```
 
-**Student (distillation) training schedule** — see full config in Section 15:
+**Student (distillation) training schedule** — only relevant if Section 0.1 confirmed dual-model is justified:
 
 ```yaml
 # config/distill_config.yaml
@@ -1068,6 +1178,8 @@ Calibrate `energy_threshold` and `conf_threshold` **separately for the teacher a
 ---
 
 ## 15. Knowledge Distillation: Teacher → Mobile Student
+
+> Only build this section if Section 0.1's gate confirmed dual-model is justified.
 
 This is the step that makes the offline mobile model viable: instead of training the small MobileNetV3/EfficientNet-Lite0 student from scratch (which would underperform), the student learns to match the **soft output distribution** of the already-trained EfficientNetV2-S teacher, in addition to the true labels.
 
@@ -1335,7 +1447,7 @@ def export_student_onnx_mobile(onnx_fp32_path, output_path="models/onnx_mobile/m
     )
 ```
 
-**Either way, produce a `model_metadata.json` bundled alongside the mobile model:**
+**Either way, produce a `model_metadata.json` bundled/downloaded alongside the mobile model:**
 
 ```json
 {
@@ -1347,11 +1459,12 @@ def export_student_onnx_mobile(onnx_fp32_path, output_path="models/onnx_mobile/m
   "energy_threshold": -2.7,
   "conf_threshold": 0.55,
   "model_version": "student-v1.3-2026-07-13",
-  "distilled_from_teacher": "teacher-v2.1-best.pt"
+  "distilled_from_teacher": "teacher-v2.1-best.pt",
+  "checksum_sha256": "REPLACE_WITH_ACTUAL_HASH"
 }
 ```
 
-**Validate mobile INT8 accuracy drop** the same way as the server model — re-run the full test set (and ideally the field-only test set) against the exported `.tflite`/`.onnx` mobile artifact, on a representative low-end device if possible, before bundling it into the app.
+**Validate mobile INT8 accuracy drop** the same way as the server model — re-run the full test set (and ideally the field-only test set) against the exported `.tflite`/`.onnx` mobile artifact, on a representative low-end device if possible, before releasing it (Section 26).
 
 ---
 
@@ -1468,9 +1581,11 @@ async def sync_upload(batch: SyncBatchRequest):
     Receives queued offline predictions/images from the mobile app once connectivity
     returns. Stores them for the next field-data collection / retraining round
     and for teacher-model re-scoring of anything the on-device student flagged
-    as uncertain.
+    as uncertain. Every record must carry a consent flag — see Section 25.
     """
     for record in batch.records:
+        if not record.consent_given:
+            continue  # never persist images without recorded consent
         # persist record.image, record.student_prediction, record.timestamp,
         # record.device_id, record.was_uncertain, record.farmer_feedback (if any)
         ...
@@ -1497,7 +1612,7 @@ The web frontend (`web/`) calls `POST /predict` with a multipart image upload an
 
 ## 21. Deployment B: On-Device Mobile Inference (Offline-First)
 
-The mobile app must produce a prediction **with zero network calls** using the distilled student model bundled inside the app package.
+The mobile app must produce a prediction **with zero network calls** using the distilled student model available on the device (bundled or downloaded — see Section 26).
 
 ### 21.1 Framework choice
 
@@ -1514,14 +1629,15 @@ The structure below assumes React Native + TFLite; the same logic applies with f
 ```typescript
 // mobile/src/inference/onDeviceModel.ts
 import { loadTensorflowModel, TensorflowModel } from 'react-native-fast-tflite';
-import modelMetadata from '../../assets/models/model_metadata.json';
+import { getActiveModelPaths } from '../modelManager/remoteModelLoader'; // [FIX] Section 26
 
 let model: TensorflowModel | null = null;
+let modelMetadata: any = null;
 
 export async function loadModel(): Promise<void> {
-  model = await loadTensorflowModel(
-    require('../../assets/models/model_int8.tflite')
-  );
+  const { modelPath, metadataPath } = await getActiveModelPaths();
+  model = await loadTensorflowModel({ url: modelPath });
+  modelMetadata = JSON.parse(await readFile(metadataPath));
 }
 
 export interface PredictionResult {
@@ -1582,8 +1698,6 @@ function argsortDescending(arr: number[]): number[] {
 
 ```typescript
 // mobile/src/inference/preprocess.ts
-import { Image } from 'react-native-vision-camera'; // or equivalent image capture result
-
 const MEAN = [0.485, 0.456, 0.406];
 const STD = [0.229, 0.224, 0.225];
 const INPUT_SIZE = 224; // matches student training resolution (§10, §15.4)
@@ -1648,9 +1762,9 @@ The mobile app must work with **zero connectivity for the core prediction flow**
 
 | Data | Stored locally | Synced when online | Purpose |
 |---|---|---|---|
-| Every prediction (image + result) | Always | Yes, batched | Retraining data, usage analytics |
+| Every prediction (image + result) | Only if farmer consented | Yes, batched | Retraining data, usage analytics |
 | Farmer feedback ("was this right?") | Always | Yes, batched | Label correction, active learning signal |
-| Predictions flagged `is_uncertain` | Always | Prioritized/immediate when online | Candidate for re-scoring by the more accurate teacher model |
+| Predictions flagged `is_uncertain` | Always (locally) | Prioritized/immediate when online, if consented | Candidate for re-scoring by the more accurate teacher model |
 | App/model version metadata | Always | With every sync batch | Debugging which model version produced which prediction |
 
 ### 22.2 Local storage
@@ -1668,6 +1782,7 @@ export interface PredictionRecord {
   modelVersion: string;       // from model_metadata.json
   createdAt: number;
   farmerFeedback?: 'correct' | 'incorrect' | null;
+  consentGiven: boolean;      // [FIX] Section 25 — required before any upload
   syncedAt?: number | null;   // null = not yet synced
 }
 
@@ -1676,7 +1791,8 @@ export async function savePredictionLocally(record: PredictionRecord): Promise<v
 }
 
 export async function getUnsyncedRecords(limit = 50): Promise<PredictionRecord[]> {
-  // SELECT * FROM predictions WHERE syncedAt IS NULL ORDER BY isUncertain DESC, createdAt ASC LIMIT ?
+  // SELECT * FROM predictions WHERE syncedAt IS NULL AND consentGiven = true
+  // ORDER BY isUncertain DESC, createdAt ASC LIMIT ?
   return [];
 }
 ```
@@ -1737,6 +1853,7 @@ async function toSyncPayload(record: PredictionRecord) {
 ### 22.4 Sync design principles
 
 - **Prediction never blocks on network.** The on-device model always produces a result immediately; syncing is a background concern the farmer never has to wait on.
+- **Never sync without recorded consent** — see Section 25.
 - **Prioritize uncertain predictions in the sync queue** — these are the most valuable for improving the model and the most likely to need a human/teacher-model second opinion.
 - **Batch, don't stream** — sync in batches of ~20-50 records to avoid hammering the API on flaky rural connectivity; retry with backoff, don't retry indefinitely without limit.
 - **Never delete local images until sync is confirmed** (`syncedAt` set) — treat the phone as the source of truth until the server acknowledges receipt.
@@ -1766,6 +1883,7 @@ Instrumentator().instrument(app).expose(app)
 - **Sync health**: track `% of predictions still unsynced after 7 days` per device — a rising number may mean a farmer's app has broken connectivity handling or the farmer is in a persistently low-connectivity area, both worth knowing.
 - **Teacher-student agreement in the field**: when an uncertain on-device prediction gets re-scored by the teacher after sync, log whether they agreed — this is a live, real-world version of the offline distillation health metric from Section 15.4.
 - **Human feedback loop**: allow farmers/extension workers to flag wrong predictions in both apps; route flagged images (with consent) into the next field-data collection round.
+- **Mobile model version distribution**: track what fraction of active devices are still on an old model version — flags rollout problems (Section 26).
 
 ---
 
@@ -1791,10 +1909,106 @@ This is the deployment gatekeeper for **both** apps — **do not ship based on p
 | p95 latency | ≤ 150ms (server GPU) | ≤ 300-500ms (budget Android CPU) |
 | INT8 accuracy drop vs. FP32 | ≤ 1% | ≤ 2% |
 | Teacher-student agreement rate (val set) | — | ≥ 90% |
+| Field-data sufficiency (Section 4.4) | Pass required | Pass required |
 
 ---
 
-## 25. Troubleshooting
+## 25. Privacy, Consent & Data Governance
+
+**[FIX — new section]** Every farmer photo captured and potentially uploaded is personal data, and in many field-collection contexts it's tied to a location. This needs explicit handling, not an implicit assumption of consent.
+
+1. **Consent at capture time**: on first use (and periodically thereafter), the app must present a clear, plain-language explanation of what happens to a photo — whether it stays on-device only, or is uploaded for model improvement — and record an explicit opt-in/opt-out choice (`consentGiven` in the local record schema, Section 22.2).
+2. **Default to on-device only.** Uploading should be opt-in, not opt-out. A farmer who never grants consent should still get full prediction functionality; they simply never contribute to the sync/retraining pipeline.
+3. **Strip or minimize location metadata** before any upload unless the farmer has specifically consented to location-tagged contributions (useful for regional disease tracking, but sensitive — treat it as a separate, higher-bar consent).
+4. **Retention policy**: define and document how long uploaded images are kept, who can access them (internal ML team, labeling contractors, extension partners), and a deletion path if a farmer withdraws consent later.
+5. **Regional compliance**: if operating in or serving users in the EU, note GDPR obligations (right to access/erasure); other regions may have their own data-protection frameworks. This is a legal question, not just an engineering one — involve counsel before scaling data collection across borders.
+6. **Labeling contractor access**: if third parties (e.g., Label Studio annotators) see farmer images, that should be covered by the same consent notice and a data-processing agreement with the contractor.
+
+---
+
+## 26. Mobile Model Versioning & Rollback
+
+**[FIX — new section]** Bundling `.tflite`/`.onnx` inside the APK/IPA means a bad model release is locked in until the next app-store review cycle — that's too slow to fix a bug once real farmers hit it. Use remote model loading instead.
+
+### 26.1 Remote model loading with local fallback
+
+```typescript
+// mobile/src/modelManager/remoteModelLoader.ts
+import RNFS from 'react-native-fs';
+
+const MODEL_MANIFEST_URL = 'https://api.yourbackend.com/mobile-model/manifest';
+const BUNDLED_MODEL_VERSION = 'student-v1.0-bundled'; // shipped in the APK as a guaranteed fallback
+
+interface ModelManifest {
+  version: string;
+  modelUrl: string;
+  metadataUrl: string;
+  checksumSha256: string;
+  minAppVersion: string;
+}
+
+export async function getActiveModelPaths(): Promise<{ modelPath: string; metadataPath: string }> {
+  const localVersion = await getLocallyCachedVersion();
+
+  try {
+    const manifest: ModelManifest = await fetchManifestIfOnline(MODEL_MANIFEST_URL);
+    if (manifest && manifest.version !== localVersion) {
+      const downloaded = await downloadAndVerify(manifest);
+      if (downloaded) {
+        await setLocallyCachedVersion(manifest.version);
+        return downloaded;
+      }
+    }
+  } catch {
+    // Offline or manifest fetch failed — fall through to whatever is cached/bundled
+  }
+
+  return getCachedOrBundledPaths(localVersion);
+}
+
+async function downloadAndVerify(manifest: ModelManifest) {
+  const modelPath = `${RNFS.DocumentDirectoryPath}/models/${manifest.version}/model.tflite`;
+  const metadataPath = `${RNFS.DocumentDirectoryPath}/models/${manifest.version}/metadata.json`;
+
+  await RNFS.downloadFile({ fromUrl: manifest.modelUrl, toFile: modelPath }).promise;
+  const actualChecksum = await computeSha256(modelPath);
+  if (actualChecksum !== manifest.checksumSha256) {
+    await RNFS.unlink(modelPath).catch(() => {});
+    return null; // corrupt/incomplete download — do not activate
+  }
+
+  await RNFS.downloadFile({ fromUrl: manifest.metadataUrl, toFile: metadataPath }).promise;
+  return { modelPath, metadataPath };
+}
+```
+
+### 26.2 Rollback strategy
+
+- **Always keep the previous known-good model version cached** alongside the new one; if the new model's on-device sanity check fails (e.g., a smoke-test image produces a nonsensical output shape or NaN), automatically fall back to the previous version rather than crashing prediction entirely.
+- **Server-side kill switch**: the manifest endpoint can point back to an older `version` at any time — this is your fastest lever if a bad model reaches production, faster than any app-store update.
+- **A/B staged rollout**: serve a new model version to a small percentage of devices first (via the manifest response, keyed by device ID hash), monitor uncertainty rate and teacher-student agreement (Section 23) for that cohort, then widen the rollout.
+- **The bundled fallback model never goes stale silently** — track its age and refresh it in at least every major app-store release, so a farmer who never gets a connection still has a reasonably recent model.
+
+---
+
+## 27. Scope Limitations: Multi-Lesion & Co-Infection
+
+**[FIX — new section]** The current taxonomy (Section 1) and model design assume **one disease label per image**. In real field conditions, a single leaf can show:
+
+- Multiple diseases at once (e.g., early co-infection of two fungal pathogens)
+- A disease alongside a nutrient deficiency or pest damage that looks visually similar
+- Progressive disease at different lesion stages on the same leaf
+
+**This is an explicit scope limitation, not an oversight** — but it should be tracked rather than silently ignored:
+
+1. **During field-data labeling** (Section 4.2), have annotators flag images where more than one condition is visibly present, even though the current pipeline will only accept a single label. This creates a dataset for future multi-label work without blocking the current single-label release.
+2. **Track how often this occurs** in the field test set — if co-infection is rare (a few percent of images), the single-label assumption is a reasonable simplification for v1. If it's common in your target crops/regions, this becomes a roadmap item, not a footnote.
+3. **Future path, if needed**: move the output head from softmax (mutually exclusive classes) to a multi-label sigmoid head, which requires re-thinking calibration (Section 13) and OOD detection (Section 14), both of which currently assume single-label softmax behavior. This is a non-trivial architecture change — don't bolt it on without redesigning those two sections deliberately.
+4. **In the meantime**, the UI/UX should avoid implying certainty the model doesn't have — e.g., phrasing like "most likely condition" rather than "the disease" softens the single-label assumption for farmers dealing with a genuinely ambiguous leaf.
+
+---
+
+## 28. Troubleshooting
 
 | Symptom | Likely Cause | Fix |
 |---|---|---|
@@ -1811,9 +2025,11 @@ This is the deployment gatekeeper for **both** apps — **do not ship based on p
 | Student accuracy much lower than teacher after distillation | Alpha/temperature not tuned, or resolution mismatch between teacher soft-targets and student training | Sweep `kd_alpha`/`kd_temperature`; confirm teacher-side inputs were resized to the student's 224px before generating soft targets (§15.4) |
 | Mobile predictions differ from web predictions on the same image | Preprocessing mismatch (interpolation method, normalization, EXIF handling) between `src/datasets.py` and `mobile/src/inference/preprocess.ts` | Run `tests/test_mobile_parity.py`; audit resize/crop/normalize step-by-step for exact parity |
 | TFLite/ONNX Mobile conversion fails or produces garbage output | Unsupported op during PyTorch → ONNX → TF → TFLite hop, or quantization calibration set too small/unrepresentative | Check converter logs for unsupported-op warnings; verify parity at each conversion hop separately, not just at the end; expand the representative dataset |
-| Mobile app slow/laggy on budget devices | Model too large for target hardware, or preprocessing done on the JS thread instead of native | Confirm INT8 (not FP32) model is bundled; move preprocessing to a native module/worker thread; verify with `benchmark_mobile_latency.py` on real low-end hardware |
+| Mobile app slow/laggy on budget devices | Model too large for target hardware, or preprocessing done on the JS thread instead of native | Confirm INT8 (not FP32) model is bundled/downloaded; move preprocessing to a native module/worker thread; verify with `benchmark_mobile_latency.py` on real low-end hardware |
 | Sync queue growing indefinitely, never draining | Connectivity detection false-positive, endpoint auth failure, or unhandled exception silently breaking the sync loop | Add explicit error logging in `runSyncCycle`; verify `NetInfo` accurately reflects real internet reachability, not just Wi-Fi association; check server auth/CORS config |
 | Farmer sees a different confidence/uncertainty behavior online vs. offline | Teacher and student calibrated with different temperature/thresholds, as expected, but not communicated in UX | This is expected given two different models — ensure the UI copy ("Unknown, please retake") is consistent even if underlying confidence numbers differ slightly |
+| Bad mobile model version reaches production | No remote versioning/rollback in place | Implement Section 26; use the manifest kill-switch to revert to the previous known-good version immediately |
+| Release blocked by field-data check unexpectedly | A class quietly regressed below the 200-image minimum (e.g., after a data-cleaning pass removed duplicates) | Re-run `scripts/check_release_readiness.py` after any data pipeline change, not just before release |
 
 ---
 
@@ -1824,9 +2040,13 @@ git clone <repo>
 cd crop-disease-classifier
 pip install -r requirements.txt
 
+# --- Decision gates (run first, see Section 0) ---
+python scripts/architecture_benchmark.py
+
 # --- Shared data pipeline ---
 python scripts/prepare_dataset.py --config config/train_config.yaml
 python scripts/build_splits.py
+python scripts/check_release_readiness.py   # blocks if field-data minimums aren't met
 
 # --- Teacher (web) ---
 python src/train.py --config config/train_config.yaml --role teacher
@@ -1834,7 +2054,7 @@ python src/calibrate.py --checkpoint models/checkpoints/teacher/best.pt
 python src/export.py --checkpoint models/checkpoints/teacher/best.pt --output models/onnx/model.onnx
 python scripts/quantize.py --input models/onnx/model.onnx --output models/quantized/model_int8.onnx
 
-# --- Student (mobile), distilled from the trained teacher ---
+# --- Student (mobile), only if Section 0.1 confirmed dual-model is justified ---
 python src/train.py --config config/distill_config.yaml --role student \
     --teacher-checkpoint models/checkpoints/teacher/best.pt
 python src/calibrate.py --checkpoint models/checkpoints/student/best.pt
@@ -1847,8 +2067,8 @@ uvicorn serving.app:app --host 0.0.0.0 --port 8000
 # --- Web frontend ---
 cd web && npm install && npm run dev
 
-# --- Mobile app (bundle model + metadata, then run) ---
-cp models/tflite/model_int8.tflite mobile/assets/models/
+# --- Mobile app (upload model to remote manifest endpoint, keep bundled fallback in assets) ---
+cp models/tflite/model_int8.tflite mobile/assets/models/   # fallback only, see Section 26
 cp models/quantized/model_metadata.json mobile/assets/models/
 cd mobile && npm install && npx react-native run-android   # or run-ios
 ```
